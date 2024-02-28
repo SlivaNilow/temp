@@ -1,0 +1,166 @@
+//свойства для фильтра
+public static function list($sectionIds, $pager, $catalogFilter = ""){
+        global $DB;
+        global $_filial; //
+        global $USER;
+        $result = [];
+        $storeId = $_filial->storeId; //id склада
+        $priceId = $_filial->priceId; //id цены
+        $propertyLinkId = CSettings::getPropertyLinkId(); //CML2_LINK
+        $propertyCodeId = CSettings::getPropertyCodeId(); //CML2_ARTICLE
+
+
+        $cache = Cache::createInstance();
+
+        $sectionIds = explode(',', $sectionIds);
+        $cacheId = implode('_', $sectionIds);
+        $cacheId = "CProperty_list_".$storeId.'_'.$priceId.'_'.$cacheId;
+        $storesIds = CUtils::userStores(); //все склады к которым имеет доступ пользоавтель
+        $cacheId .= '_'.implode('_',$storesIds);
+
+
+        if (CSettings::isCacheEnabled() && !$catalogFilter && $cache->initCache(60*5, $cacheId ,'custom')) { // 5 минут
+            $result = $cache->getVars(); // достаем переменные из кеша
+        } else  {
+            /**
+             * значения фильтра из url
+             */
+            //otdelka-is-gk-or-nab-and-shirina-is-45_sm-or-drugoe_
+            $propertyValuesFilter = [];
+            foreach(explode("-and-", $catalogFilter) as $propertyAndValues){
+                $data = explode("-is-", $propertyAndValues);
+
+                if(count($data) == 2){
+                    $propertyName = $data[0];
+
+                    /**
+                     * получаем id свойства по его коду
+                     */
+                    $obProp = CIBlockProperty::GetList(
+                        ['ID' => 'ASC'],
+                        ['IBLOCK_ID' => 2, 'CODE' => strtoupper($propertyName), 'ACTIVE' => 'Y']
+                    );
+                    $propId = false;
+                    if ($arProp = $obProp->GetNext()) {
+                        $propId = $arProp['ID'];
+                    }
+                    $arValues = explode("-or-", $data[1]);
+
+                    foreach($arValues as $value){
+                        $propertyValuesFilter[$data[0]][$value] = $value;                        
+                    }
+                }
+            }
+
+            //ранее было условие что для авторизованных цена больше нуля
+            //теперь надо добавить что цена может быть 0 для скоро в продаже матрица матрица
+            if($USER->isAuthorized()){
+                $sqlPrice = " AND (
+                    (  
+                        productStore.amount > 0  AND 
+                        productPropertyMatrix.value != 'matritsa' AND
+                        productPrice.price >= 0 
+                    )
+                     OR 
+                    (
+                        productStore.amount > 0  OR 
+                        productPropertyMatrix.value = 'matritsa'
+                    )
+			    )";
+            } else {
+                $sqlPrice = " AND (
+			        productStore.amount > 0  OR 
+			        productPropertyMatrix.value = 'matritsa'
+			    )";
+            }
+
+            $propertyMatrixId = CSettings::getPropertyMatrixId();
+            $propertyStatusId = CSettings::getPropertyStatusId();
+
+            $sqlStore = CUtils::userStoresSql();
+
+            /*elements*/
+            /**
+             * коментарий выше, это предел совершенства, идеально описывает ситуацию ниже.. сарказм.
+             * на сколько я понимаю запрос ниже, получает все уникальные комбинации своство-значение
+             * с фильтрацией по складу пользователя, типу цены пользователя и текущему разделу
+             */
+            $sectionIds = implode(',', $sectionIds);
+            $dbResult = $DB->Query("
+                SELECT DISTINCT
+                    property.id propertyId,
+                    property.name propertyName,
+                    property.code propertyCode,
+                    sectionProperty.display_expanded display,
+                    productPropertyValue.value propertyValue,
+                    productPropertyValue.id propertyValueId,
+                    IFNULL(productPropertyValueName.name, productPropertyValue.value) propertyValueName
+                FROM b_iblock_element product
+                    INNER JOIN b_iblock_element_property productPropertyGroup ON product.id = productPropertyGroup.iblock_element_id
+                    LEFT OUTER JOIN (SELECT product_id, SUM(amount) amount FROM b_catalog_store_product {$sqlStore} GROUP BY product_id) productStore ON product.id = productStore.product_id 
+                    LEFT OUTER JOIN b_catalog_price productPrice ON product.id = productPrice.product_id AND productPrice.catalog_group_id = {$priceId}
+                    INNER JOIN b_iblock_element_property productPropertyValue ON product.id = productPropertyValue.iblock_element_id
+                    LEFT OUTER JOIN t_hlbd productPropertyValueName ON productPropertyValue.iblock_property_id = productPropertyValueName.propertyId AND productPropertyValue.value = productPropertyValueName.code
+                    INNER JOIN b_iblock_property property ON productPropertyValue.iblock_property_id = property.id
+                    INNER JOIN b_iblock_section_property sectionProperty ON property.id = sectionProperty.property_id
+                    INNER JOIN (
+                        SELECT
+                            productGroup.id
+                        FROM b_iblock_element productGroup
+                            INNER JOIN b_iblock_element_property productProperty ON productGroup.id = productProperty.value 
+                        WHERE productGroup.iblock_id = 1
+                          AND productGroup.active = 'Y'
+                          AND productGroup.iblock_section_id IN ({$sectionIds})
+                          AND productProperty.iblock_property_id = {$propertyLinkId}
+                        GROUP BY productGroup.id
+                    ) productGroupStore ON productPropertyGroup.value = productGroupStore.id
+                    LEFT OUTER JOIN b_iblock_element_property productPropertyMatrix ON product.id = productPropertyMatrix.iblock_element_id AND productPropertyMatrix.iblock_property_id = {$propertyMatrixId}
+                    
+                WHERE product.iblock_id = 2
+                  AND product.active = 'Y'
+                  AND productPropertyGroup.iblock_property_id = {$propertyLinkId}
+            
+                  AND property.id NOT IN ({$propertyLinkId}, {$propertyCodeId})
+                  AND sectionProperty.iblock_id = 1 
+                  AND sectionProperty.smart_filter = 'Y' 
+                    {$sqlPrice}
+                ORDER BY 
+                    property.sort,
+                    propertyName,
+                    productPropertyValueName.sort,
+                    propertyValueName
+            ");
+
+
+            $propertyId = -1;
+            $property = null;
+            while ($dbRow = $dbResult->Fetch())
+            {
+
+                $data = (object)$dbRow;
+
+                if($propertyId != $data->propertyId){
+                    $propertyId = $data->propertyId;
+                    $property = new CProperty($data->propertyId, $data->propertyName, $data->propertyCode, isset($propertyValuesFilter[mb_strtolower($data->propertyCode)]), $data->display);
+                    $result[] = $property;
+                }
+                $property->addValue(
+                    new CPropertyValue(
+                        $data->propertyId,
+                        $data->propertyValue,
+
+                        $data->propertyValueName,
+                        ($property->selectable? isset($propertyValuesFilter[$property->code][$data->propertyValue]): false),
+                        $data->propertyValueId,
+                    )
+                );
+            }
+
+            if (CSettings::isCacheEnabled() && $cache->startDataCache()) {
+                $cache->endDataCache($result); // записываем в кеш
+            }
+
+        }
+
+        return $result;
+    }
